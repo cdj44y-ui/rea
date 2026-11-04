@@ -7,7 +7,11 @@ import type {
   JavaScriptSemanticTimerOperation,
 } from "./javascriptSemanticIr.js";
 import { createSemanticCallableIdStack } from "./javascriptSemanticCallableStack.js";
-import { semanticStaticPropertyName } from "./javascriptAstValues.js";
+import {
+  readExactJavaScriptLiteral,
+  semanticStaticPropertyName,
+  unwrapJavaScriptExpression,
+} from "./javascriptAstValues.js";
 import {
   resolveSemanticBindingState,
   semanticResolutionBlocked,
@@ -15,7 +19,8 @@ import {
   type JavaScriptSemanticBindingState,
 } from "./javascriptSemanticState.js";
 import { semanticBindingAtRead } from "./javascriptSemanticMutationInitializers.js";
-import { traverseJavaScriptAst } from "./javascriptSemanticTraversal.js";
+import { traverseJavaScriptValueAst } from "./javascriptSemanticTraversal.js";
+import { isUnmodifiedGlobalReference } from "./javascriptSemanticAmbientWrites.js";
 import { range } from "./javascriptStaticAnalysisHelpers.js";
 import {
   builtinDataEffectMethod,
@@ -99,7 +104,7 @@ export const collectJavaScriptSemanticAsyncEffects = (
   const callableIds = new Set(callables.map(({ callableId }) => callableId));
   const callableStack = createSemanticCallableIdStack(callableIds);
   const ancestors: t.Node[] = [];
-  traverseJavaScriptAst(program, {
+  traverseJavaScriptValueAst(program, state.erasedSyntaxNodes, {
     enter: (node, parent) => {
       callableStack.enter(node, parent);
       if (t.isCallExpression(node) || t.isOptionalCallExpression(node)) {
@@ -126,6 +131,36 @@ export const collectJavaScriptSemanticAsyncEffects = (
   };
 };
 
+/**
+ * A listener must be a function, and Node throws `ERR_INVALID_ARG_TYPE` before
+ * anything is registered or removed when it is not. An exactly readable literal
+ * that cannot be a function is therefore not an event operation, while an
+ * identifier, a call result or a spread may still supply one and keeps its
+ * operation.
+ *
+ * A class expression passes Node's own `typeof` check, so it is kept.
+ */
+const rejectsEventListener = (listener: t.Node): boolean => {
+  if (t.isSpreadElement(listener)) return false;
+  const value = unwrapJavaScriptExpression(listener).node;
+  if (t.isFunctionExpression(value) || t.isArrowFunctionExpression(value))
+    return false;
+  if (t.isClassExpression(value)) return false;
+  // A numeric literal is always a number, including the non-finite value Babel
+  // stores for `1e999`, which the exact-value reader refuses to price.
+  if (t.isNumericLiteral(value)) return true;
+  // Every unary operator yields a primitive, and a primitive is never callable.
+  return (
+    t.isUnaryExpression(value) ||
+    readExactJavaScriptLiteral(value).found ||
+    t.isTemplateLiteral(value) ||
+    t.isBigIntLiteral(value) ||
+    t.isRegExpLiteral(value) ||
+    t.isArrayExpression(value) ||
+    t.isObjectExpression(value)
+  );
+};
+
 const collectEvent = (
   node: t.CallExpression | t.OptionalCallExpression,
   ownerCallableId: string | null,
@@ -145,6 +180,15 @@ const collectEvent = (
   const listenerArgument = EVENT_LISTENER_METHODS.includes(method)
     ? node.arguments[1]
     : undefined;
+  // A leading spread shifts the runtime argument positions, so argument 1 is not
+  // provably the listener: `e.on(...["x", fn], 1)` registers `fn` and ignores the
+  // trailing `1`.
+  if (
+    !t.isSpreadElement(eventArgument) &&
+    listenerArgument !== undefined &&
+    rejectsEventListener(listenerArgument)
+  )
+    return;
   const emitter = emitterIdentity(member.object, state);
   const eventName = dataEffectLiteralString(eventArgument);
   output.push({
@@ -189,20 +233,52 @@ const emitterIdentity = (
 } => {
   if (t.isIdentifier(node)) {
     const binding = resolveSemanticBindingState(state, node, node.name);
-    if (binding !== undefined)
+    if (binding !== undefined) {
+      const read = semanticBindingAtRead(binding, node, state.parentsByNode);
+      const origins = [
+        ...read.binding.initializers,
+        ...read.binding.referenceInitializers,
+      ];
+      const replaced = binding.definitions.some(
+        ({ kind }) => kind === "assignment",
+      );
+      const origin = origins.length === 1 ? origins[0] : undefined;
+      const complete =
+        !replaced ||
+        (read.status === "ordered" &&
+          read.hasDefiniteInitializer &&
+          origin !== undefined);
       return {
-        key: `binding:${binding.bindingId}`,
+        key: !replaced
+          ? `binding:${binding.bindingId}`
+          : complete
+            ? `binding:${binding.bindingId}:origin:${origin?.node.start ?? -1}:${origin?.node.end ?? -1}`
+            : `expression:${node.start ?? -1}:${node.end ?? -1}`,
         bindingId: binding.bindingId,
-        complete: true,
+        complete,
       };
+    }
     return {
       key: `global:${node.name}`,
       bindingId: null,
       complete: !semanticResolutionBlocked(state, node, node.name),
     };
   }
-  if (t.isThisExpression(node))
-    return { key: "this", bindingId: null, complete: true };
+  if (t.isThisExpression(node)) {
+    let owner = state.parentsByNode.get(node);
+    while (
+      owner !== undefined &&
+      !t.isClass(owner) &&
+      !(t.isFunction(owner) && !t.isArrowFunctionExpression(owner))
+    )
+      owner = state.parentsByNode.get(owner);
+    // Lexical receiver ownership does not establish one runtime instance.
+    return {
+      key: `this:${owner?.start ?? -1}:${owner?.end ?? -1}`,
+      bindingId: null,
+      complete: false,
+    };
+  }
   return {
     key: `expression:${String(node.start ?? -1)}:${String(node.end ?? -1)}`,
     bindingId: null,
@@ -333,7 +409,8 @@ const timerMethod = (
     if (binding === undefined) {
       const method = admittedTimerMethod(callee.name);
       if (method === null) return null;
-      return semanticResolutionBlocked(state, callee, callee.name)
+      return semanticResolutionBlocked(state, callee, callee.name) ||
+        !isUnmodifiedGlobalReference(callee, state, callee.name)
         ? null
         : method;
     }
